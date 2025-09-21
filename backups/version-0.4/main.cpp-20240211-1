@@ -1,0 +1,423 @@
+/**************************************************************************
+  ToDo:
+
+  changelog:
+  0.4:  - changed version number
+        - rewrote code for cleaner seperation between local and global variables
+        - implemented structural naming scheme for better human readability:
+              THIS_IS_A_DEFINED_VALUE
+              _THIS_IS_A_GLOBAL_VARIABLE
+              otherVariablesAndFuntionsAreLikeThis
+              function scoped variables get the function initials prefixed in lower case
+        - implemented operating modes:
+          - pwm manual
+          - setting of PWM frequency
+          - external (non PWM) powersupply for tracks
+          - run-in program
+
+  0.3: - added sh1106 oled driver (changable with commenting out the driver not in use)
+       - rotated screen orentation 180 degrees
+       - textual changes to reflect it is a speed controller for the testbench
+       - added 31Khz pwm timer prescaler option (commented out)
+       - converted ino sketch to vscode/platformIO project
+
+  0.2: - swapped over pins 5 and 11 for pwm timer prescaling without messing up
+         the nano internaly used timing functions like delay()
+  
+  0.1: - initial release
+         
+ **************************************************************************/
+
+#include <Arduino.h>
+#include <SPI.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+//#include <Adafruit_SSD1306.h>
+#include <Adafruit_SH110X.h>
+
+// general defines (used by functions)
+#define VERSION_NUMBER "0.4"
+#define MAX_SPEED 127
+#define MIN_SPEED -127
+#define DEBOUNCE_TIME  300
+#define DEFAULT_FREQUENCY_MODE 7
+
+// pin defenitions:
+#define OLED_MOSI       9 // oled pin D1
+#define OLED_CLK        10 //oled pin: D0
+#define OLED_DC         5 
+#define OLED_CS         12
+#define OLED_RESET      8
+#define ENABLE_PIN      11 
+#define IN_1_PIN        4
+#define IN_2_PIN        6
+#define RED_BUTTON_PIN  3
+#define BLUE_BUTTON_PIN 2
+#define POT_PIN         A6
+#define RELAY_PIN       7
+
+// screen related:
+#define SCREEN_WIDTH 128 // OLED display width, in pixels
+#define SCREEN_HEIGHT 64 // OLED display height, in pixels
+#define LINE_HEIGHT 8
+//Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, OLED_MOSI, OLED_CLK, OLED_DC, OLED_RESET, OLED_CS);
+Adafruit_SH1106G display = Adafruit_SH1106G(SCREEN_WIDTH, SCREEN_HEIGHT, OLED_MOSI, OLED_CLK, OLED_DC, OLED_RESET, OLED_CS);
+
+/*
+  global variables and consts:
+*/
+bool _RED_BUTTON = false;
+bool _BLUE_BUTTON = false;
+const char *_FREQUENCY_NAME[7] = {"31372.55 Hz", "3921.16 Hz", "980.39 Hz", "490.20 Hz", "245.10 Hz", "122.55 Hz","30.64 Hz"};
+byte _FREQUENCY_MODE = DEFAULT_FREQUENCY_MODE;
+
+/*
+-------------- support functions
+*/
+void setSpeed(int ssSpeed)
+{
+  bool ssReverse = false;
+  if (ssSpeed < 0) ssReverse = true;
+  analogWrite(ENABLE_PIN, abs(ssSpeed*2));
+  digitalWrite(IN_1_PIN, ssReverse);
+  digitalWrite(IN_2_PIN, !ssReverse);
+}
+
+int getSpeedMapped(int gsmPin)
+{
+  // requieres #define for _MAX_SPEED and _MIN_SPEED
+  int gsmSpeed = analogRead(gsmPin);
+  int gsmSpeedMapped=map(gsmSpeed,0,1023,MIN_SPEED, MAX_SPEED);
+  return gsmSpeedMapped;
+}
+
+int getSpeedPct(int gspSpeedMapped)
+{
+  // requieres #define for _MAX_SPEED
+  int gspSpeedPct=map(abs(gspSpeedMapped), 0 , MAX_SPEED, 0, 100);
+  return gspSpeedPct;
+}
+
+void displaySpeed(int dsSpeedMapped, int dsLine)
+{
+  bool dsReverse = false;
+  if (dsSpeedMapped < 0) dsReverse = true;
+  // requieres #define for _LINE_HEIGHT
+  // needs 2 lines on the screen
+  display.setCursor(0, (dsLine*LINE_HEIGHT));
+  display.print("snelheid: ");
+  display.print(getSpeedPct(dsSpeedMapped));
+  display.println("%   ");
+  display.println();
+  if (abs(dsSpeedMapped) > 3)
+  {
+    if (dsReverse) display.println("<<<<--------    ");
+    else display.println("-------->>>>    ");
+  }
+  else display.println("------------    ");
+  display.display();
+  setSpeed(dsSpeedMapped);
+}
+
+void drawStartup(void) {
+  //requieres #define for _VERSION_NUMBER
+  display.clearDisplay();
+
+  display.setTextSize(1);            
+  //display.setTextColor(SSD1306_WHITE);        // Draw white text
+  display.setTextColor(SH110X_WHITE);        // Draw white text
+  display.setCursor(0,0);             // Start at top-left corner
+  display.println(F("Rij"));
+  display.println(F("regelaar"));
+  display.println(F("rollenbank"));
+  display.println(VERSION_NUMBER);
+  display.display();
+  delay(500);
+}
+
+void redButton()
+{
+  // requieres _RED_BUTTON global bool variablre
+  static unsigned long last_interrupt_time = 0;
+  unsigned long interrupt_time = millis();
+  bool redButtonPinCheck = digitalRead(!RED_BUTTON_PIN);
+  if ((interrupt_time - last_interrupt_time > DEBOUNCE_TIME)&& redButtonPinCheck) _RED_BUTTON = true;
+  last_interrupt_time = interrupt_time;
+}
+
+void blueButton()
+{
+  // requieres _BLUE_BUTTON global bool variable
+  static unsigned long last_interrupt_time = 0;
+  unsigned long interrupt_time = millis();
+  bool blueButtonPinCheck = digitalRead(!BLUE_BUTTON_PIN);
+  if ((interrupt_time - last_interrupt_time > DEBOUNCE_TIME)&& blueButtonPinCheck) _BLUE_BUTTON = true;
+  last_interrupt_time = interrupt_time;
+}
+
+void speedFade(int sfStartSpeed, int sfEndSpeed, byte sfFrequencyMode)
+{
+  const int sfTimeStep = 2;
+  int sfSpeedStep = 1;
+  int sfSpeed = sfStartSpeed;
+  if (sfStartSpeed >= sfEndSpeed) sfSpeedStep = sfSpeedStep * -1;
+  long sfStartTime = millis();
+  long sfTime = sfStartTime;
+  while ((sfSpeed != sfEndSpeed))
+  {
+    displaySpeed(sfSpeed, 5);
+    sfTime=millis();
+    if (sfTime >= (sfStartTime + sfTimeStep)) sfSpeed = sfSpeed + sfSpeedStep;
+  }
+}
+
+void speedLoop(int slSpeed, unsigned long slLoopSeconds, byte slFrequencyMode)
+{
+  unsigned long slStartTime = millis();
+  unsigned long slEndTime = slStartTime + slLoopSeconds *1000;
+  unsigned long slTime = slStartTime;
+  unsigned long slTimeRemaining = slLoopSeconds;
+  bool slCountDown = true;
+  while (slCountDown && !_BLUE_BUTTON)
+  {
+    slTime = millis();
+    slTimeRemaining = (slEndTime - slTime)/1000;
+    if (slTime > slEndTime) slCountDown = false;
+    display.setCursor(0, (4*LINE_HEIGHT));
+    display.print("timer: ");
+    display.print(slTimeRemaining);
+    display.print("s   ");
+    display.display();
+    displaySpeed(slSpeed, 5);
+  }
+  if (_BLUE_BUTTON)
+  {
+    speedFade(slSpeed, 0, slFrequencyMode);
+  }
+}
+
+void pwmManual(byte pwmmFrequencyMode)
+{
+  display.clearDisplay();
+  display.setCursor(0,0);
+  display.println("Rijregelaar");
+  display.print("hand PWM ");
+  display.println(_FREQUENCY_NAME[pwmmFrequencyMode - 1]);
+  display.display();
+  speedFade(0, (getSpeedMapped(POT_PIN)),pwmmFrequencyMode);
+  while (!_BLUE_BUTTON)
+  {
+    displaySpeed((getSpeedMapped(POT_PIN)),5);
+  }
+  _BLUE_BUTTON = false;
+  speedFade((getSpeedMapped(POT_PIN)), 0, pwmmFrequencyMode);
+  setSpeed(0);
+}
+
+void pwmRunin(byte pwmrFrequencyMode)
+{
+  int pwmrSpeed = 0;
+  bool pwmrDone = false;
+  const unsigned long pwmrLoopTime = 300;
+  display.clearDisplay();
+  display.setCursor(0,0);
+  display.println("Rijregelaar");
+  display.println("run-in program");
+  display.print("PWM ");
+  display.println(_FREQUENCY_NAME[pwmrFrequencyMode - 1]);
+  display.display();
+  _BLUE_BUTTON = false;
+  while (!_BLUE_BUTTON && !pwmrDone)
+  {
+    //speedFade(0, 20,pwmrFrequencyMode);
+    for (int pwmrNewSpeed = 20; pwmrNewSpeed <= 100; pwmrNewSpeed = pwmrNewSpeed + 20)
+    {
+      speedFade(pwmrSpeed, pwmrNewSpeed, pwmrFrequencyMode);
+      speedLoop(pwmrNewSpeed, pwmrLoopTime, pwmrFrequencyMode);
+      if (_BLUE_BUTTON) break;
+      speedFade(pwmrNewSpeed, pwmrNewSpeed*-1, pwmrFrequencyMode);
+      speedLoop(pwmrNewSpeed*-1, pwmrLoopTime, pwmrFrequencyMode);
+      if (_BLUE_BUTTON) break;
+      pwmrSpeed = pwmrNewSpeed*-1;
+    }
+    pwmrDone = true;
+  }
+  speedFade(pwmrSpeed, 0, pwmrFrequencyMode);
+  setSpeed(0);
+  if (_BLUE_BUTTON)
+  {
+    display.setCursor(0, 4*LINE_HEIGHT);
+    display.println("aborted ");
+    display.display();
+    _BLUE_BUTTON = false;
+  }
+  else
+  {
+    display.setCursor(0, 4*LINE_HEIGHT);
+    display.println("done ");
+    display.display();
+  }
+  delay (500);
+  display.clearDisplay();
+  display.display();
+}
+
+int pwmFreq(byte pwmfFrequencyMode)
+{
+  /*
+      TCCR2B = TCCR2B & B11111000 | B00000001;    // set timer 2 divisor to     1 for PWM frequency of 31372.55 Hz
+      TCCR2B = TCCR2B & B11111000 | B00000010;    // set timer 2 divisor to     8 for PWM frequency of  3921.16 Hz
+      TCCR2B = TCCR2B & B11111000 | B00000011;    // set timer 2 divisor to    32 for PWM frequency of   980.39 Hz
+      TCCR2B = TCCR2B & B11111000 | B00000100;    // set timer 2 divisor to    64 for PWM frequency of   490.20 Hz (The DEFAULT)
+      TCCR2B = TCCR2B & B11111000 | B00000101;    // set timer 2 divisor to   128 for PWM frequency of   245.10 Hz
+      TCCR2B = TCCR2B & B11111000 | B00000110;    // set timer 2 divisor to   256 for PWM frequency of   122.55 Hz
+      TCCR2B = TCCR2B & B11111000 | B00000111;    // set timer 2 divisor to  1024 for PWM frequency of    30.64 Hz
+  */
+  byte selectedFreq = pwmfFrequencyMode;
+  display.clearDisplay();
+  display.setCursor(0,0);
+  display.println("Select PWM frequency");
+  display.println("Rood : selecteert");
+  display.println("Blauw: bevestigd");
+  display.display();
+  while (!_BLUE_BUTTON)
+  {
+    if (_RED_BUTTON){
+      _RED_BUTTON = false;
+      selectedFreq++;
+      if (selectedFreq > 7) selectedFreq = 1;
+    }
+    display.setCursor(0,48);
+    display.print(selectedFreq);
+    display.print(": ");
+    display.print(_FREQUENCY_NAME[selectedFreq - 1]);
+    display.println("   ");
+    display.display();
+  }
+  TCCR2B = (TCCR2B & B11111000) | selectedFreq;
+  display.println("selected");
+  display.display();
+  delay(500);
+  _BLUE_BUTTON = false;
+  return selectedFreq;
+}
+
+void externalPower(int epLine)
+{
+  display.clearDisplay();
+  display.setCursor(0,0);
+  display.println("Rijregelaar");
+  display.println("External power");
+  display.display();
+  digitalWrite(RELAY_PIN,0);
+  while (!_BLUE_BUTTON)
+  {
+    display.setCursor(0, (epLine*LINE_HEIGHT));
+    display.println("active");
+    display.display();
+  }
+  _BLUE_BUTTON = false;
+  display.setCursor(0,(epLine*LINE_HEIGHT));
+  display.println("ended       ");
+  display.display();
+  digitalWrite(RELAY_PIN,1);
+  delay(500);
+  display.clearDisplay();
+  display.display();
+}
+/*
+-------------- end of support functions
+*/
+
+void setup() 
+{
+  TCCR2B = (TCCR2B & B11111000) | _FREQUENCY_MODE;
+  //setup pin 11 AND 3 for phase correct PWM:
+  TCCR2A = _BV(COM2A1) | _BV(WGM20);
+
+  display.setRotation(0);
+  //display.begin(SSD1306_SWITCHCAPVCC);
+  display.begin();
+  // Show initial display buffer contents on the screen --
+  // the library initializes this with an Adafruit splash screen.
+  display.display();
+  delay(500); // Pause for 0.5 seconds
+
+  // Clear the buffer
+  display.clearDisplay();
+
+  drawStartup();  
+  pinMode(IN_1_PIN, OUTPUT);
+  pinMode(IN_2_PIN, OUTPUT);
+  pinMode(ENABLE_PIN, OUTPUT);
+  pinMode(RELAY_PIN, OUTPUT);
+  pinMode(RED_BUTTON_PIN, INPUT_PULLUP);
+  pinMode(BLUE_BUTTON_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(RED_BUTTON_PIN), redButton, FALLING);
+  attachInterrupt(digitalPinToInterrupt(BLUE_BUTTON_PIN), blueButton, FALLING);
+  digitalWrite(RELAY_PIN,1);
+  display.clearDisplay();
+  display.setCursor(0,0);
+  display.println("init done");
+  display.display();
+  delay(500);
+}
+
+void loop() 
+{
+  int operatingMode = 1;
+  display.clearDisplay();
+  display.setTextColor(1,0);
+  display.setCursor(0,0);             // Start at top-left corner
+  display.println("selecteer Modus:");
+  display.println("Rood : selecteert");
+  display.println("Blauw: bevestigd");
+  display.display();
+  _BLUE_BUTTON = false;
+  _RED_BUTTON = false;
+  while (!_BLUE_BUTTON){
+    if (_RED_BUTTON){
+      _RED_BUTTON = false;
+      operatingMode++;
+      if (operatingMode > 4) operatingMode = 1;
+    }
+    display.setCursor(0,(5*LINE_HEIGHT));
+    switch (operatingMode)
+    {
+      case 1:
+        display.println("PWM handbediening        ");
+        break;
+      case 2:
+        display.println("PWM auto run-in      ");
+        break;
+      case 3:
+        display.println("kies PWM frequentie      ");
+        break;
+      case 4:
+        display.println("externe voeding      ");
+        break;
+      default:
+        break;
+    }
+    display.display();
+  }
+  _BLUE_BUTTON = false;
+
+  switch (operatingMode)
+  {
+    case 1:
+      pwmManual(_FREQUENCY_MODE);
+      break;
+    case 2:
+      pwmRunin(_FREQUENCY_MODE);
+      break;
+    case 3:
+      _FREQUENCY_MODE=pwmFreq(_FREQUENCY_MODE);
+      break;
+    case 4:
+      externalPower(5);
+      break;
+    default:
+      break;
+  }
+}

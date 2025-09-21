@@ -1,0 +1,202 @@
+/**************************************************************************
+  changelog:
+  0.3: - added sh1106 oled driver (changable with commenting out the driver not in use)
+       - rotated screen orentation 180 degrees
+       - textual changes to reflect it is a speed controller for the testbench
+       - added 31Khz pwm timer prescaler option (commented out)
+       - converted ino sketch to vscode/platformIO project
+
+  0.2: - swapped over pins 5 and 11 for pwm timer prescaling without messing up
+         the nano internaly used timing functions like delay()
+  
+  0.1: - initial release
+         
+ **************************************************************************/
+
+#include <SPI.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+//#include <Adafruit_SSD1306.h>
+#include <Adafruit_SH110X.h>
+
+
+#define SCREEN_WIDTH 128 // OLED display width, in pixels
+#define SCREEN_HEIGHT 64 // OLED display height, in pixels
+
+// Declaration for SSD1306 display connected using software SPI (default case):
+#define OLED_MOSI   9 // oled pin D1
+#define OLED_CLK   10 //oled pin: D0
+#define OLED_DC    5 // new pin! switched with enable pin for pwm output
+#define OLED_CS    12
+#define OLED_RESET 8
+//Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, OLED_MOSI, OLED_CLK, OLED_DC, OLED_RESET, OLED_CS);
+
+Adafruit_SH1106G display = Adafruit_SH1106G(SCREEN_WIDTH, SCREEN_HEIGHT, OLED_MOSI, OLED_CLK, OLED_DC, OLED_RESET, OLED_CS);
+
+#define enablePin  11 // new pin! switched with oled dc pin
+#define in1Pin     4
+#define in2Pin     6
+#define powerPin   3
+#define autoPin    2
+#define potPin     A6
+#define relayPin   7
+#define _DEBOUNCE_TIME 300
+#define _VERSION_NUMBER "0.3"
+int speed = 0;
+int speedpct = speed;
+int speedmapped = speed;
+int speedabs= speed;
+boolean reverse = false;
+boolean poweron = false;
+boolean automate = false;
+boolean powerread = false;
+boolean autoread = false;
+boolean powerPinCheck = true;
+boolean autoPinCheck = true;
+
+// -----------------------------------------------------------------
+// support functions:
+void setMotor(int speed, boolean reverse)
+{
+  analogWrite(enablePin, speed*2);
+  digitalWrite(in1Pin, ! reverse);
+  digitalWrite(in2Pin, reverse);
+}
+void drawstartup(void) {
+  display.clearDisplay();
+
+  display.setTextSize(2);            
+  //display.setTextColor(SSD1306_WHITE);        // Draw white text
+  display.setTextColor(SH110X_WHITE);        // Draw white text
+  display.setCursor(0,0);             // Start at top-left corner
+  display.println(F("Rij"));
+  display.println(F("regelaar"));
+  display.println(F("rollenbank"));
+  display.println(_VERSION_NUMBER);
+  display.display();
+  delay(1500);
+}
+
+void powerint()
+{
+  static unsigned long last_interrupt_time = 0;
+  unsigned long interrupt_time = millis();
+  powerPinCheck = digitalRead(!powerPin);
+  if ((interrupt_time - last_interrupt_time > _DEBOUNCE_TIME)&& powerPinCheck) poweron = !poweron;
+  last_interrupt_time = interrupt_time;
+}
+
+void autoint()
+{
+  static unsigned long last_interrupt_time = 0;
+  unsigned long interrupt_time = millis();
+  autoPinCheck = digitalRead(!autoPin);
+  if ((interrupt_time - last_interrupt_time > _DEBOUNCE_TIME)&& autoPinCheck) automate = !automate;
+  last_interrupt_time = interrupt_time;
+}
+// end of support functions
+
+// ----------------------------------------------------------------------------------
+
+void setup() {
+  // the 3 usefull options for prescaling timer 2 in regards to driving a dc motorised modeltrain:
+  //TCCR2B = (TCCR2B & B11111000) | B00000001;    // set timer 2 divisor to    1 for PWM frequency of 31372.55 Hz (klokanker motoren)
+  //TCCR2B = (TCCR2B & B11111000) | B00000110;    // set timer 2 divisor to  256 for PWM frequency of   122.55 Hz 
+  TCCR2B = (TCCR2B & B11111000) | B00000111;    // set timer 2 divisor to 1024 for PWM frequency of    30.64 Hz 
+
+  //setup pin 11 AND 3 for phase correct PWM:
+  TCCR2A = _BV(COM2A1) | _BV(WGM20);
+
+  display.setRotation(0);
+  //display.begin(SSD1306_SWITCHCAPVCC);
+  display.begin();
+
+
+  // Show initial display buffer contents on the screen --
+  // the library initializes this with an Adafruit splash screen.
+  display.display();
+  delay(1500); // Pause for 2 seconds
+
+  // Clear the buffer
+  display.clearDisplay();
+
+  drawstartup();    // Draw 'stylized' characters
+
+  pinMode(in1Pin, OUTPUT);
+  pinMode(in2Pin, OUTPUT);
+  pinMode(enablePin, OUTPUT);
+  pinMode(powerPin, INPUT_PULLUP);
+  pinMode(autoPin, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(powerPin), powerint, FALLING);
+  attachInterrupt(digitalPinToInterrupt(autoPin), autoint, FALLING);
+  automate = LOW;
+  poweron = LOW;
+}
+
+
+
+void loop() {
+
+  if (!automate){
+    speed = analogRead(potPin);
+    speedmapped=map(speed,0,1023,-127,127);
+  }
+  else{
+    //speed = inrij algortime, output -127 <-> +127
+  }
+    speedpct=map(abs(speedmapped),0,127,0,100);
+  if (!poweron) {
+    speedabs=0;
+    digitalWrite(relayPin, LOW);
+    
+  }
+  if (poweron) {
+    speedabs=abs(speedmapped); 
+    if (speedabs < 5) speedabs = 0;
+    digitalWrite(relayPin, HIGH);
+  }
+
+  if (speedmapped < 0) reverse = false;
+  else reverse = true;
+  display.clearDisplay();
+  display.setTextSize(2);            
+  //display.setTextColor(SSD1306_WHITE);        // Draw white text
+  display.setTextColor(SH110X_WHITE);        // Draw white text
+  display.setCursor(0,0);             // Start at top-left corner
+  //display.println("rijden met");
+  
+  
+  
+  if(!poweron) 
+  {
+    display.println("uit/trafo");
+    display.println();
+  }
+
+
+  if (poweron) 
+  {
+    if (!automate) {
+      display.println("pwm, hand");
+      display.println("bediening");
+    }
+    else {
+      display.println("pwm, inrij");
+      display.println("programma");
+    }
+    display.println(" snelheid:");
+    display.print(" ");
+    display.print(speedpct);
+    display.setCursor(45,48);
+    display.print("% ");
+    if (abs(speedmapped) > 3)
+    {
+      if (reverse) display.println("-->");
+     else display.println("<--");
+    }
+    else display.println("---");
+  }
+  display.display();
+  setMotor(speedabs, reverse);
+}
+
